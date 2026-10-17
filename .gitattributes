@@ -1,0 +1,2 @@
+# Keep Debian packaging out of upstream release tarballs.
+debian export-ignore
