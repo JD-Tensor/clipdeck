@@ -1,0 +1,10 @@
+# Build output
+dist/
+
+# debhelper build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/gnome-shell-extension-clipdeck/

@@ -1,0 +1,10 @@
+{
+  "uuid": "clipdeck@jdtensor.com",
+  "name": "Clipdeck",
+  "description": "Clipboard history in the top bar. Click the clipboard icon to see everything you copied or cut (text, links, images, screenshots, files and videos) and paste any of it again.",
+  "shell-version": ["48", "49", "50"],
+  "session-modes": ["user", "unlock-dialog"],
+  "settings-schema": "org.gnome.shell.extensions.clipdeck",
+  "url": "https://github.com/JD-Tensor/clipdeck",
+  "version": 1
+}

@@ -1,0 +1,124 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
+.clipdeck-card {
+  width: 400px;
+  padding: 12px;
+  spacing: 8px;
+  border-radius: 16px;
+  background-color: rgba(36, 36, 40, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  color: #f2f2f2;
+}
+
+.clipdeck-header {
+  padding: 0 4px;
+}
+
+.clipdeck-title {
+  font-weight: bold;
+  font-size: 11pt;
+}
+
+.clipdeck-clear-button {
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 9pt;
+  color: #8ab4f8;
+}
+
+.clipdeck-clear-button:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.clipdeck-search {
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 10pt;
+}
+
+.clipdeck-scroll {
+  max-height: 520px;
+}
+
+.clipdeck-list {
+  spacing: 6px;
+  padding-right: 4px;
+}
+
+.clipdeck-item {
+  padding: 10px 8px 8px 12px;
+  border-radius: 10px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border: 1px solid transparent;
+  text-align: left;
+}
+
+.clipdeck-item:hover {
+  background-color: rgba(255, 255, 255, 0.10);
+}
+
+.clipdeck-item:selected {
+  background-color: rgba(53, 132, 228, 0.28);
+  border-color: rgba(53, 132, 228, 0.85);
+}
+
+.clipdeck-item-content {
+  spacing: 6px;
+}
+
+.clipdeck-text {
+  font-size: 10pt;
+  color: #f2f2f2;
+}
+
+.clipdeck-caption {
+  font-size: 8pt;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.clipdeck-thumb {
+  border-radius: 6px;
+}
+
+.clipdeck-file-row {
+  spacing: 8px;
+  font-size: 10pt;
+}
+
+.clipdeck-more {
+  font-size: 9pt;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.clipdeck-item-actions {
+  spacing: 2px;
+  padding-left: 6px;
+}
+
+.clipdeck-icon-button {
+  padding: 5px;
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.clipdeck-icon-button:hover {
+  background-color: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.clipdeck-icon-button:checked {
+  color: #8ab4f8;
+}
+
+.clipdeck-empty {
+  padding: 32px 8px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.clipdeck-footer {
+  font-size: 8pt;
+  color: rgba(255, 255, 255, 0.45);
+  padding: 0 4px;
+}

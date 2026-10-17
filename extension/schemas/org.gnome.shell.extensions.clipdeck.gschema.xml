@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.clipdeck"
+          path="/org/gnome/shell/extensions/clipdeck/">
+    <key name="history-size" type="i">
+      <range min="5" max="500"/>
+      <default>25</default>
+      <summary>Number of unpinned items to keep</summary>
+    </key>
+    <key name="paste-on-select" type="b">
+      <default>true</default>
+      <summary>Paste into the focused app after choosing an item</summary>
+      <description>When off, choosing an item only puts it on the clipboard.</description>
+    </key>
+    <key name="persist-history" type="b">
+      <default>true</default>
+      <summary>Keep history across logins</summary>
+      <description>When off, unpinned items are cleared at every login (pinned items always stay).</description>
+    </key>
+    <key name="paused" type="b">
+      <default>false</default>
+      <summary>Stop recording new clipboard items</summary>
+    </key>
+    <key name="save-images" type="b">
+      <default>true</default>
+      <summary>Record images and screenshots</summary>
+    </key>
+    <key name="max-image-mb" type="i">
+      <range min="1" max="200"/>
+      <default>25</default>
+      <summary>Largest image (in MB) to record</summary>
+    </key>
+    <key name="clear-trigger" type="i">
+      <default>0</default>
+      <summary>Internal: incremented by the preferences window to clear history</summary>
+    </key>
+  </schema>
+</schemalist>
