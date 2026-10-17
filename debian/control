@@ -1,8 +1,9 @@
 Source: gnome-shell-extension-clipdeck
 Section: gnome
+Priority: optional
 Maintainer: Subhadip Jana <subhadipjana@jdtensor.com>
 Build-Depends: debhelper-compat (= 13), libglib2.0-bin
-Standards-Version: 4.7.3
+Standards-Version: 4.7.4
 Homepage: https://github.com/JD-Tensor/clipdeck
 Vcs-Browser: https://github.com/JD-Tensor/clipdeck
 Vcs-Git: https://github.com/JD-Tensor/clipdeck.git
