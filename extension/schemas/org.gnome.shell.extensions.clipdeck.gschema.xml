@@ -8,9 +8,9 @@
       <summary>Number of unpinned items to keep</summary>
     </key>
     <key name="paste-on-select" type="b">
-      <default>true</default>
-      <summary>Paste into the focused app after choosing an item</summary>
-      <description>When off, choosing an item only puts it on the clipboard.</description>
+      <default>false</default>
+      <summary>Also paste into the focused app after choosing an item</summary>
+      <description>Off by default: choosing an item only puts it back on the clipboard. When on, Clipdeck also sends a simulated Ctrl+V (Ctrl+Shift+V in terminals) to the focused window.</description>
     </key>
     <key name="persist-history" type="b">
       <default>true</default>

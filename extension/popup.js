@@ -9,12 +9,16 @@ import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GdkPixbuf from 'gi://GdkPixbuf';
+import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {ensureActorVisibleInScrollView} from 'resource:///org/gnome/shell/misc/animationUtils.js';
+
+Gio._promisify(Gio.File.prototype, 'query_info_async');
+Gio._promisify(GdkPixbuf.Pixbuf, 'get_file_info_async');
 
 const PREVIEW_LINES = 5;
 const PREVIEW_CHARS = 300;
@@ -59,23 +63,26 @@ function fileName(uri) {
     return file.get_basename() ?? uri;
 }
 
-function queryFile(uri) {
+async function queryFile(uri) {
     try {
-        return Gio.File.new_for_uri(uri).query_info(FILE_ATTRIBUTES, Gio.FileQueryInfoFlags.NONE, null);
+        return await Gio.File.new_for_uri(uri).query_info_async(FILE_ATTRIBUTES,
+            Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null);
     } catch {
         return null;
     }
 }
 
-// Fits the image inside THUMB_WIDTH x THUMB_HEIGHT without enlarging small ones.
-function loadThumbnail(path, width = 0, height = 0) {
-    if (!width || !height) {
-        try {
-            [, width, height] = GdkPixbuf.Pixbuf.get_file_info(path);
-        } catch {
-            width = height = 0;
-        }
+async function imageSize(path) {
+    try {
+        const [, width, height] = await GdkPixbuf.Pixbuf.get_file_info_async(path, null);
+        return [width, height];
+    } catch {
+        return [0, 0];
     }
+}
+
+// Fits the image inside THUMB_WIDTH x THUMB_HEIGHT without enlarging small ones.
+function loadThumbnail(path, width, height) {
     const fit = width && height ? Math.min(1, THUMB_WIDTH / width, THUMB_HEIGHT / height) : 1;
     const [w, h] = width && height
         ? [Math.max(1, Math.round(width * fit)), Math.max(1, Math.round(height * fit))]
@@ -90,7 +97,7 @@ function loadThumbnail(path, width = 0, height = 0) {
 export const ClipboardPopup = GObject.registerClass({
     Signals: {'closed': {}},
 }, class ClipboardPopup extends St.Widget {
-    _init(store, anchor, onActivate, onOpenSettings) {
+    _init(store, anchor, pasteOnSelect, onActivate, onOpenSettings) {
         super._init({
             reactive: true,
             x: 0,
@@ -113,7 +120,17 @@ export const ClipboardPopup = GObject.registerClass({
             orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
         });
-        this._card.connect('notify::height', () => this._reposition());
+        // Moving the card from inside a layout pass would need a second pass;
+        // do it just before the next redraw instead.
+        this._card.connect('notify::height', () => {
+            if (this._repositionLater)
+                return;
+            this._repositionLater = global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
+                this._repositionLater = 0;
+                this._reposition();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
         this.add_child(this._card);
 
         const header = new St.BoxLayout({style_class: 'clipdeck-header'});
@@ -159,20 +176,20 @@ export const ClipboardPopup = GObject.registerClass({
         this._scroll.set_child(this._list);
         this._card.add_child(this._scroll);
 
+        const verb = pasteOnSelect ? 'paste' : 'copy';
         this._card.add_child(new St.Label({
             style_class: 'clipdeck-footer',
-            text: '↑↓ select · Enter paste · Alt+1…9 quick paste · Ctrl+P pin · Del remove · Esc close',
+            text: `↑↓ select · Enter or Alt+1…9 ${verb} · Ctrl+P pin · Del remove · Esc close`,
         }));
 
-        // Close on clicks outside the card. Presses inside it bubble up here
-        // too; stopping them earlier would cancel the buttons' click gestures.
-        this.connect('button-press-event', (_actor, event) => {
-            const target = global.stage.get_event_actor(event);
-            if (target && this._card.contains(target))
-                return Clutter.EVENT_PROPAGATE;
-            this.close();
-            return Clutter.EVENT_STOP;
+        // Close on clicks outside the card.
+        const outsideClick = new Clutter.ClickGesture({recognize_on_press: true});
+        outsideClick.connect('may-recognize', () => {
+            const target = global.stage.get_event_actor(outsideClick.get_point_event(0));
+            return !target || !this._card.contains(target);
         });
+        outsideClick.connect('recognize', () => this.close());
+        this.add_action(outsideClick);
         this.connect('key-press-event', (_actor, event) => this._onKeyPress(event));
 
         this._storeChangedId = this._store.connectChanged(() => this._rebuild());
@@ -181,9 +198,9 @@ export const ClipboardPopup = GObject.registerClass({
 
     open() {
         Main.uiGroup.add_child(this);
-        this._grab = Main.pushModal(this, {actionMode: Shell.ActionMode.POPUP});
         this._monitor = Main.layoutManager.findMonitorForActor(this._anchor) ??
             Main.layoutManager.primaryMonitor;
+        this._grab = Main.pushModal(this, {actionMode: Shell.ActionMode.POPUP});
         this._rebuild();
         this._entry.grab_key_focus();
     }
@@ -192,6 +209,10 @@ export const ClipboardPopup = GObject.registerClass({
         if (this._closed)
             return;
         this._closed = true;
+        if (this._repositionLater) {
+            global.compositor.get_laters().remove(this._repositionLater);
+            this._repositionLater = 0;
+        }
         if (this._grab) {
             Main.popModal(this._grab);
             this._grab = null;
@@ -208,6 +229,7 @@ export const ClipboardPopup = GObject.registerClass({
         this._visible = this._store.entries.filter(e => this._matches(e, query));
         this._selected = Math.min(this._selected, Math.max(0, this._visible.length - 1));
 
+        this._buildSerial = (this._buildSerial ?? 0) + 1;
         this._list.destroy_all_children();
         this._rows = this._visible.map((entry, i) => {
             const row = this._createRow(entry, i);
@@ -263,11 +285,12 @@ export const ClipboardPopup = GObject.registerClass({
         });
         box.add_child(content);
 
-        const kind = this._fillContent(content, entry);
-        content.add_child(new St.Label({
-            style_class: 'clipdeck-caption',
-            text: `${index < 9 ? `${index + 1} · ` : ''}${kind} · ${timeAgo(entry.time)}`,
-        }));
+        const caption = new St.Label({style_class: 'clipdeck-caption'});
+        const setKind = kind => {
+            caption.text = `${index < 9 ? `${index + 1} · ` : ''}${kind} · ${timeAgo(entry.time)}`;
+        };
+        this._fillContent(content, entry, setKind);
+        content.add_child(caption);
 
         const actions = new St.BoxLayout({
             style_class: 'clipdeck-item-actions',
@@ -295,8 +318,9 @@ export const ClipboardPopup = GObject.registerClass({
         return button;
     }
 
-    // Adds the preview widgets and returns a short description of the item.
-    _fillContent(content, entry) {
+    // Adds the preview widgets and reports a short description of the item
+    // through setKind (later, for files, once their details are read).
+    _fillContent(content, entry, setKind) {
         switch (entry.type) {
         case 'text': {
             const label = new St.Label({style_class: 'clipdeck-text', text: textPreview(entry.text), x_expand: true});
@@ -304,49 +328,37 @@ export const ClipboardPopup = GObject.registerClass({
             label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
             label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
             content.add_child(label);
-            return entry.text.length > 1 ? `Text · ${entry.text.length} chars` : 'Text';
+            setKind(entry.text.length > 1 ? `Text · ${entry.text.length} chars` : 'Text');
+            break;
         }
         case 'image': {
             content.add_child(loadThumbnail(this._store.blobPath(entry), entry.width, entry.height));
             const dims = entry.width ? ` ${entry.width}×${entry.height}` : '';
-            return `Image${dims} · ${formatSize(entry.size)}`;
+            setKind(`Image${dims} · ${formatSize(entry.size)}`);
+            break;
         }
         case 'files':
-            return this._fillFiles(content, entry.uris);
-        default:
-            return '';
+            this._fillFiles(content, entry.uris, setKind);
+            break;
         }
     }
 
-    _fillFiles(content, uris) {
-        const infos = uris.map(queryFile);
-
-        if (uris.length === 1 && infos[0]) {
-            const info = infos[0];
-            const type = info.get_content_type() ?? '';
-            const path = Gio.File.new_for_uri(uris[0]).get_path();
-            const thumb = info.get_attribute_byte_string('thumbnail::path') ||
-                (type.startsWith('image/') && path && info.get_size() < 50 * 1024 * 1024 ? path : null);
-            if (thumb)
-                content.add_child(loadThumbnail(thumb));
-        }
-
-        uris.slice(0, MAX_FILE_ROWS).forEach((uri, i) => {
-            const info = infos[i];
+    // Shows names straight away, then fills in icons, thumbnails and sizes
+    // once the file details have been read.
+    _fillFiles(content, uris, setKind) {
+        const rows = uris.slice(0, MAX_FILE_ROWS).map(uri => {
             const row = new St.BoxLayout({style_class: 'clipdeck-file-row'});
-            row.add_child(new St.Icon({
-                gicon: info?.get_icon() ?? Gio.ThemedIcon.new('text-x-generic'),
+            const icon = new St.Icon({
+                gicon: Gio.ThemedIcon.new('text-x-generic'),
                 icon_size: 20,
                 style_class: 'clipdeck-file-icon',
-            }));
-            const label = new St.Label({
-                text: info ? info.get_display_name() : `${fileName(uri)} (missing)`,
-                y_align: Clutter.ActorAlign.CENTER,
-                x_expand: true,
             });
+            row.add_child(icon);
+            const label = new St.Label({text: fileName(uri), y_align: Clutter.ActorAlign.CENTER, x_expand: true});
             label.clutter_text.ellipsize = Pango.EllipsizeMode.MIDDLE;
             row.add_child(label);
             content.add_child(row);
+            return {icon, label};
         });
         if (uris.length > MAX_FILE_ROWS) {
             content.add_child(new St.Label({
@@ -354,17 +366,45 @@ export const ClipboardPopup = GObject.registerClass({
                 text: `+${uris.length - MAX_FILE_ROWS} more`,
             }));
         }
+        setKind(uris.length > 1 ? `${uris.length} files` : 'File');
 
-        if (uris.length > 1)
-            return `${uris.length} files`;
-        const type = infos[0]?.get_content_type() ?? '';
-        if (type.startsWith('video/'))
-            return `Video · ${formatSize(infos[0].get_size())}`;
-        if (type.startsWith('image/'))
-            return `Image file · ${formatSize(infos[0].get_size())}`;
-        if (type === 'inode/directory')
-            return 'Folder';
-        return infos[0] ? `File · ${formatSize(infos[0].get_size())}` : 'File';
+        const serial = this._buildSerial;
+        const stillShown = () => !this._closed && serial === this._buildSerial;
+        Promise.all(uris.slice(0, MAX_FILE_ROWS).map(queryFile)).then(async infos => {
+            if (!stillShown())
+                return;
+            infos.forEach((info, i) => {
+                if (info) {
+                    rows[i].icon.gicon = info.get_icon();
+                    rows[i].label.text = info.get_display_name();
+                } else {
+                    rows[i].label.text = `${fileName(uris[i])} (missing)`;
+                }
+            });
+
+            const info = infos[0];
+            if (uris.length > 1 || !info)
+                return;
+            const type = info.get_content_type() ?? '';
+            const size = formatSize(info.get_size());
+            if (type.startsWith('video/'))
+                setKind(`Video · ${size}`);
+            else if (type.startsWith('image/'))
+                setKind(`Image file · ${size}`);
+            else if (type === 'inode/directory')
+                setKind('Folder');
+            else
+                setKind(`File · ${size}`);
+
+            const path = Gio.File.new_for_uri(uris[0]).get_path();
+            const thumb = info.get_attribute_byte_string('thumbnail::path') ||
+                (type.startsWith('image/') && path && info.get_size() < 50 * 1024 * 1024 ? path : null);
+            if (!thumb)
+                return;
+            const [width, height] = await imageSize(thumb);
+            if (stillShown())
+                content.insert_child_at_index(loadThumbnail(thumb, width, height), 0);
+        });
     }
 
     _updateSelection(scroll) {

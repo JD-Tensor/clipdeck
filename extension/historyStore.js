@@ -5,13 +5,25 @@
 //
 // History lives in ~/.local/share/clipdeck/history.json and image data in
 // ~/.local/share/clipdeck/images/. Both are created private (0700/0600)
-// because clipboard contents are often sensitive.
+// because clipboard contents are often sensitive. All file access is
+// asynchronous so the shell never waits on the disk.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GdkPixbuf from 'gi://GdkPixbuf';
 
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+Gio._promisify(Gio.File.prototype, 'replace_contents_bytes_async', 'replace_contents_finish');
+Gio._promisify(Gio.File.prototype, 'make_directory_async');
+Gio._promisify(Gio.File.prototype, 'set_attributes_async');
+Gio._promisify(Gio.File.prototype, 'query_info_async');
+Gio._promisify(Gio.File.prototype, 'delete_async');
+Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
+Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async');
+Gio._promisify(GdkPixbuf.Pixbuf, 'get_file_info_async');
+
 const MAX_TEXT_CHARS = 4 * 1024 * 1024;
+const WRITE_FLAGS = Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION;
 
 const IMAGE_EXTENSIONS = {
     'image/png': 'png',
@@ -26,44 +38,92 @@ const IMAGE_EXTENSIONS = {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+function isError(e, code) {
+    return e instanceof GLib.Error && e.matches(Gio.IOErrorEnum, code);
+}
+
+async function ensurePrivateDir(file, cancellable) {
+    try {
+        await file.make_directory_async(GLib.PRIORITY_DEFAULT, cancellable);
+    } catch (e) {
+        if (isError(e, Gio.IOErrorEnum.EXISTS))
+            return;
+        throw e;
+    }
+    const info = new Gio.FileInfo();
+    info.set_attribute_uint32('unix::mode', 0o700);
+    await file.set_attributes_async(info, Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, cancellable);
+}
+
 export class HistoryStore {
     constructor(settings) {
         this._settings = settings;
-        this._dir = GLib.build_filenamev([GLib.get_user_data_dir(), 'clipdeck']);
-        this._blobDir = GLib.build_filenamev([this._dir, 'images']);
-        this._file = Gio.File.new_for_path(GLib.build_filenamev([this._dir, 'history.json']));
+        this._dir = Gio.File.new_for_path(GLib.build_filenamev([GLib.get_user_data_dir(), 'clipdeck']));
+        this._blobDir = this._dir.get_child('images');
+        this._file = this._dir.get_child('history.json');
+        this._cancellable = new Gio.Cancellable();
         this._listeners = new Map();
         this._nextListenerId = 1;
         this._saveId = 0;
+        this._saving = false;
+        this._saveAgain = false;
+        // Nothing is written until the saved history has been read, so an
+        // early save can never replace it with a partial list.
+        this._loaded = false;
         this.entries = [];
-
-        GLib.mkdir_with_parents(this._blobDir, 0o700);
     }
 
-    load({clearUnpinned = false} = {}) {
+    async load({clearUnpinned = false} = {}) {
+        await ensurePrivateDir(this._dir, this._cancellable);
+        await ensurePrivateDir(this._blobDir, this._cancellable);
+
+        let entries = [];
         try {
-            const [, contents] = this._file.load_contents(null);
+            const [contents] = await this._file.load_contents_async(this._cancellable);
             const data = JSON.parse(decoder.decode(contents));
             if (Array.isArray(data.entries))
-                this.entries = data.entries.filter(e => this._isValid(e));
+                entries = data.entries.filter(e => this._isWellFormed(e));
         } catch (e) {
-            if (!(e instanceof GLib.Error && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)))
+            if (isError(e, Gio.IOErrorEnum.CANCELLED))
+                throw e;
+            if (!isError(e, Gio.IOErrorEnum.NOT_FOUND))
                 console.error(`clipdeck: could not load history: ${e}`);
         }
 
+        // Drop image entries whose file has gone missing.
+        const present = await Promise.all(entries.map(async e => {
+            if (e.type !== 'image')
+                return true;
+            try {
+                await this._blobDir.get_child(e.blob).query_info_async('standard::type',
+                    Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, this._cancellable);
+                return true;
+            } catch {
+                return false;
+            }
+        }));
+        entries = entries.filter((_e, i) => present[i]);
+
+        // Items copied before loading finished come first.
+        const hashes = new Set(this.entries.map(e => e.hash));
+        this.entries = [...this.entries, ...entries.filter(e => !hashes.has(e.hash))];
         if (clearUnpinned)
             this.entries = this.entries.filter(e => e.pinned);
 
+        this._loaded = true;
         this._trim();
-        this._removeOrphanBlobs();
         this._changed();
+        this._removeOrphanBlobs();
     }
 
+    // Writes any pending change and stops all work. Safe to call from
+    // disable(): the final write is started here and finishes on its own.
     destroy() {
+        this._cancellable.cancel();
         if (this._saveId) {
             GLib.source_remove(this._saveId);
             this._saveId = 0;
-            this._save();
+            this._writeFile(null).catch(e => console.error(`clipdeck: could not save history: ${e}`));
         }
         this._listeners.clear();
     }
@@ -79,7 +139,7 @@ export class HistoryStore {
     }
 
     blobPath(entry) {
-        return GLib.build_filenamev([this._blobDir, entry.blob]);
+        return this._blobDir.get_child(entry.blob).get_path();
     }
 
     addText(text) {
@@ -89,24 +149,24 @@ export class HistoryStore {
         return this._add({type: 'text', text, hash});
     }
 
-    addImage(bytes, mime) {
+    async addImage(bytes, mime) {
         const hash = GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, bytes);
         if (this.entries.some(e => e.hash === hash))
             return this._add({hash});
 
         const blob = `${hash}.${IMAGE_EXTENSIONS[mime] ?? 'img'}`;
-        const path = GLib.build_filenamev([this._blobDir, blob]);
+        const file = this._blobDir.get_child(blob);
         try {
-            Gio.File.new_for_path(path).replace_contents(bytes.toArray(), null, false,
-                Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            await file.replace_contents_bytes_async(bytes, null, false, WRITE_FLAGS, this._cancellable);
         } catch (e) {
-            console.error(`clipdeck: could not save image: ${e}`);
+            if (!isError(e, Gio.IOErrorEnum.CANCELLED))
+                console.error(`clipdeck: could not save image: ${e}`);
             return null;
         }
 
         let width = 0, height = 0;
         try {
-            [, width, height] = GdkPixbuf.Pixbuf.get_file_info(path);
+            [, width, height] = await GdkPixbuf.Pixbuf.get_file_info_async(file.get_path(), this._cancellable);
         } catch {
             // Unknown format; the preview simply omits the size.
         }
@@ -159,8 +219,10 @@ export class HistoryStore {
         if (idx >= 0) {
             [entry] = this.entries.splice(idx, 1);
             entry.time = Date.now();
-        } else {
+        } else if (partial.type) {
             entry = {id: GLib.uuid_string_random(), time: Date.now(), pinned: false, ...partial};
+        } else {
+            return null;
         }
         this.entries.unshift(entry);
         this._trim();
@@ -181,7 +243,7 @@ export class HistoryStore {
         removed.forEach(e => this._deleteBlobIfUnused(e));
     }
 
-    _isValid(e) {
+    _isWellFormed(e) {
         if (!e || typeof e.id !== 'string' || typeof e.hash !== 'string')
             return false;
         switch (e.type) {
@@ -190,8 +252,7 @@ export class HistoryStore {
         case 'files':
             return Array.isArray(e.uris) && e.uris.length > 0;
         case 'image':
-            return typeof e.blob === 'string' &&
-                GLib.file_test(this.blobPath(e), GLib.FileTest.EXISTS);
+            return typeof e.blob === 'string' && !e.blob.includes('/');
         default:
             return false;
         }
@@ -200,26 +261,25 @@ export class HistoryStore {
     _deleteBlobIfUnused(entry) {
         if (!entry.blob || this.entries.some(e => e.blob === entry.blob))
             return;
-        try {
-            Gio.File.new_for_path(this.blobPath(entry)).delete(null);
-        } catch {
-            // Already gone.
-        }
+        this._blobDir.get_child(entry.blob).delete_async(GLib.PRIORITY_DEFAULT, null)
+            .catch(() => {});  // Already gone.
     }
 
-    _removeOrphanBlobs() {
+    async _removeOrphanBlobs() {
         const used = new Set(this.entries.map(e => e.blob).filter(Boolean));
         try {
-            const dir = Gio.File.new_for_path(this._blobDir);
-            const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
-            let info;
-            while ((info = enumerator.next_file(null))) {
-                if (!used.has(info.get_name()))
-                    dir.get_child(info.get_name()).delete(null);
+            const enumerator = await this._blobDir.enumerate_children_async('standard::name',
+                Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, this._cancellable);
+            let infos;
+            while ((infos = await enumerator.next_files_async(50, GLib.PRIORITY_DEFAULT, this._cancellable)).length) {
+                for (const info of infos) {
+                    if (!used.has(info.get_name()))
+                        this._blobDir.get_child(info.get_name()).delete_async(GLib.PRIORITY_DEFAULT, null).catch(() => {});
+                }
             }
-            enumerator.close(null);
         } catch (e) {
-            console.error(`clipdeck: could not clean image folder: ${e}`);
+            if (!isError(e, Gio.IOErrorEnum.CANCELLED))
+                console.error(`clipdeck: could not clean image folder: ${e}`);
         }
     }
 
@@ -227,7 +287,7 @@ export class HistoryStore {
         for (const callback of this._listeners.values())
             callback();
 
-        if (!this._saveId) {
+        if (this._loaded && !this._saveId) {
             this._saveId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 500, () => {
                 this._saveId = 0;
                 this._save();
@@ -236,13 +296,29 @@ export class HistoryStore {
         }
     }
 
-    _save() {
-        try {
-            const json = JSON.stringify({version: 1, entries: this.entries});
-            this._file.replace_contents(encoder.encode(json), null, false,
-                Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-        } catch (e) {
-            console.error(`clipdeck: could not save history: ${e}`);
+    // One write at a time; changes made during a write trigger another one.
+    async _save() {
+        if (this._saving) {
+            this._saveAgain = true;
+            return;
         }
+        this._saving = true;
+        try {
+            do {
+                this._saveAgain = false;
+                await this._writeFile(this._cancellable);
+            } while (this._saveAgain);
+        } catch (e) {
+            if (!isError(e, Gio.IOErrorEnum.CANCELLED))
+                console.error(`clipdeck: could not save history: ${e}`);
+        } finally {
+            this._saving = false;
+        }
+    }
+
+    _writeFile(cancellable) {
+        const json = JSON.stringify({version: 1, entries: this.entries});
+        return this._file.replace_contents_bytes_async(new GLib.Bytes(encoder.encode(json)),
+            null, false, WRITE_FLAGS, cancellable);
     }
 }

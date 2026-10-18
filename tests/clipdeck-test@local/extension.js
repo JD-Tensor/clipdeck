@@ -30,7 +30,7 @@ const bytesOf = s => new GLib.Bytes(new TextEncoder().encode(s));
 // mouse is exercised.
 let pointer = null;
 async function clickActor(actor) {
-    pointer ??= Clutter.get_default_backend().get_default_seat()
+    pointer ??= global.stage.context.get_backend().get_default_seat()
         .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
     const [x, y] = actor.get_transformed_position();
     const t = () => GLib.get_monotonic_time();
@@ -155,6 +155,7 @@ export default class TestExt extends Extension {
         check('popup closed after choosing', !obj._popup);
         check('icon not highlighted after close', !ind.has_style_pseudo_class('active'));
         check('clicked image is on clipboard', clip.get_mimetypes(C).includes(imgMime));
+        check('paste is off by default: no Ctrl+V sent', obj._settings.get_boolean('paste-on-select') === false && !obj._virtualKeyboard);
         check('image moved to top, no dup', obj._store.entries[0].type === 'image' && obj._store.entries.length === 7);
 
         const fileEntry = obj._store.entries.find(x => x.type === 'files' && x.uris.length === 3);
@@ -167,6 +168,13 @@ export default class TestExt extends Extension {
         obj._activate(textEntry);
         await sleep(600);
         check('clipboard holds text', (await getText()) === textEntry.text);
+
+        // Opting in to paste sends Ctrl+V after copying.
+        obj._settings.set_boolean('paste-on-select', true);
+        obj._activate(textEntry);
+        await sleep(600);
+        check('paste opt-in sends Ctrl+V', !!obj._virtualKeyboard);
+        obj._settings.set_boolean('paste-on-select', false);
 
         obj._store.togglePin(textEntry.id);
         obj._settings.set_int('clear-trigger', obj._settings.get_int('clear-trigger') + 1);
@@ -207,5 +215,19 @@ export default class TestExt extends Extension {
         await sleep(800);
         check('re-enable reloads history', Main.extensionManager.lookup(UUID).stateObj._store.entries.length === 6);
         check('re-enable adds icon', !!Main.panel.statusArea[UUID]);
+
+        // Locking the screen disables the extension; with "keep history after
+        // logging out" off, unlocking must not wipe the history.
+        const objR = Main.extensionManager.lookup(UUID).stateObj;
+        objR._settings.set_boolean('persist-history', false);
+        Main.extensionManager.disableExtension(UUID);
+        await sleep(300);
+        Main.extensionManager.enableExtension(UUID);
+        await sleep(800);
+        check('unlock keeps history when not persisting', Main.extensionManager.lookup(UUID).stateObj._store.entries.length === 6);
+        Main.extensionManager.lookup(UUID).stateObj._settings.set_boolean('persist-history', true);
+
+        const meta = Main.extensionManager.lookup(UUID).metadata;
+        check('no lock-screen session mode', !meta['session-modes']);
     }
 }

@@ -22,8 +22,8 @@ export default class ClipdeckPreferences extends ExtensionPreferences {
         settings.bind('history-size', size, 'value', Gio.SettingsBindFlags.DEFAULT);
         general.add(size);
 
-        general.add(this._switchRow(settings, 'paste-on-select', 'Paste after choosing an item',
-            'When off, the item is only copied to the clipboard'));
+        general.add(this._switchRow(settings, 'paste-on-select', 'Also paste after choosing an item',
+            'Sends Ctrl+V to the window you were using. When off, the item is only copied.'));
         general.add(this._switchRow(settings, 'persist-history', 'Keep history after logging out',
             'When off, unpinned items are cleared at every login'));
         general.add(this._switchRow(settings, 'paused', 'Pause recording',

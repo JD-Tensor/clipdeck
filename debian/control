@@ -10,14 +10,15 @@ Vcs-Git: https://github.com/JD-Tensor/clipdeck.git
 
 Package: gnome-shell-extension-clipdeck
 Architecture: all
-Depends: ${misc:Depends}, gnome-shell (>= 48~), gnome-shell (<< 51~)
+Depends: ${misc:Depends}, gnome-shell (>= 50~), gnome-shell (<< 52~)
 Description: clipboard history in the GNOME Shell top bar
  Clipdeck adds a clipboard icon to the GNOME Shell top bar. Clicking it
  shows a history of everything recently copied or cut: text, links,
  images, screenshots and files (including videos, shown with
  thumbnails).
  .
- Choosing an item puts it back on the clipboard and pastes it into the
- focused window. The history can be searched, and items can be pinned
- or removed. It is stored privately in the user's home directory, and
- items that password managers mark as secret are never recorded.
+ Choosing an item puts it back on the clipboard; pasting it straight
+ into the focused window can be turned on in the settings. The history
+ can be searched, and items can be pinned or removed. It is stored
+ privately in the user's home directory, and items that password
+ managers mark as secret are never recorded.

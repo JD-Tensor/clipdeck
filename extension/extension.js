@@ -6,7 +6,8 @@
 // Watches the CLIPBOARD selection, records text, images (including
 // screenshots) and copied/cut files (any type, including videos). A clipboard
 // icon in the top bar opens the history; choosing an item puts it back on the
-// clipboard and pastes it into the focused window.
+// clipboard. Pasting it into the focused window as well is optional and off
+// by default, because it works by sending a simulated Ctrl+V.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -20,6 +21,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
 import {HistoryStore} from './historyStore.js';
+
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
 import {ClipboardPopup} from './popup.js';
 
 const CLIPBOARD = St.ClipboardType.CLIPBOARD;
@@ -43,6 +46,12 @@ const TERMINAL_CLASSES = [
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
+// The extension is disabled while the screen is locked and enabled again on
+// unlock, but this module stays loaded for the whole login session. This
+// flag makes "don't keep history after logging out" clear the history once
+// per login rather than on every unlock.
+let clearedThisLogin = false;
+
 function parseUris(bytes, mime) {
     const lines = decoder.decode(bytes.toArray()).split(/\r?\n/).map(l => l.trim())
         .filter(l => l && !l.startsWith('#'));
@@ -60,25 +69,18 @@ class ClipboardIndicator extends PanelMenu.Button {
         this.add_child(new St.Icon({icon_name: 'edit-paste-symbolic', style_class: 'system-status-icon'}));
         this._onClick = onClick;
 
-        // Signals rather than vfunc overrides: the parent classes do not
-        // implement these vfuncs in every GNOME version, so chaining up fails.
-        this.connect('button-press-event', () => this._click());
-        this.connect('touch-event', (_actor, event) => {
-            if (event.type() !== Clutter.EventType.TOUCH_BEGIN)
-                return Clutter.EVENT_PROPAGATE;
-            return this._click();
-        });
+        const click = new Clutter.ClickGesture({recognize_on_press: true});
+        click.connect('recognize', () => this._onClick());
+        this.add_action(click);
+
+        // Space or Enter when the icon has keyboard focus (Ctrl+Alt+Tab).
         this.connect('key-press-event', (_actor, event) => {
             const key = event.get_key_symbol();
             if (key !== Clutter.KEY_space && key !== Clutter.KEY_Return && key !== Clutter.KEY_KP_Enter)
                 return Clutter.EVENT_PROPAGATE;
-            return this._click();
+            this._onClick();
+            return Clutter.EVENT_STOP;
         });
-    }
-
-    _click() {
-        this._onClick();
-        return Clutter.EVENT_STOP;
     }
 });
 
@@ -92,7 +94,12 @@ export default class ClipdeckExtension extends Extension {
         this._popup = null;
 
         this._store = new HistoryStore(this._settings);
-        this._store.load({clearUnpinned: !this._settings.get_boolean('persist-history')});
+        const clearUnpinned = !this._settings.get_boolean('persist-history') && !clearedThisLogin;
+        clearedThisLogin = true;
+        this._store.load({clearUnpinned}).catch(e => {
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                console.error(`clipdeck: could not open history: ${e}`);
+        });
 
         this._indicator = new ClipboardIndicator(() => this._togglePopup());
         // Right after the clock in the middle of the top bar.
@@ -109,11 +116,6 @@ export default class ClipdeckExtension extends Extension {
                 this._scheduleCapture();
         });
 
-        this._sessionModeId = Main.sessionMode.connect('updated', () => {
-            if (Main.sessionMode.isLocked)
-                this._closePopup();
-        });
-
         this._scheduleCapture();
     }
 
@@ -124,7 +126,6 @@ export default class ClipdeckExtension extends Extension {
         this._indicator = null;
 
         this._selection.disconnect(this._ownerChangedId);
-        Main.sessionMode.disconnect(this._sessionModeId);
         this._settingsIds.forEach(id => this._settings.disconnect(id));
 
         for (const id of [this._captureId, this._pasteId]) {
@@ -155,7 +156,7 @@ export default class ClipdeckExtension extends Extension {
     }
 
     _capture() {
-        if (this._settings.get_boolean('paused') || Main.sessionMode.isLocked)
+        if (this._settings.get_boolean('paused'))
             return;
 
         const mimes = this._clipboard.get_mimetypes(CLIPBOARD) ?? [];
@@ -185,7 +186,8 @@ export default class ClipdeckExtension extends Extension {
                     return;
                 if (bytes.get_size() > this._settings.get_int('max-image-mb') * 1024 * 1024)
                     return;
-                this._store.addImage(bytes, imageMime);
+                this._store.addImage(bytes, imageMime).catch(e =>
+                    console.error(`clipdeck: could not record image: ${e}`));
             });
         };
 
@@ -223,6 +225,7 @@ export default class ClipdeckExtension extends Extension {
             return;
         }
         this._popup = new ClipboardPopup(this._store, this._indicator,
+            this._settings.get_boolean('paste-on-select'),
             entry => this._activate(entry), () => this.openPreferences());
         this._popup.connect('closed', () => {
             this._popup = null;
@@ -237,16 +240,16 @@ export default class ClipdeckExtension extends Extension {
         this._popup = null;
     }
 
-    _activate(entry) {
+    async _activate(entry) {
         try {
-            this._setClipboard(entry);
+            await this._setClipboard(entry);
         } catch (e) {
             console.error(`clipdeck: could not restore item: ${e}`);
-            Main.notify('Clipboard', 'This item can no longer be pasted.');
+            Main.notify('Clipboard', 'This item is no longer available.');
             return;
         }
 
-        if (!this._settings.get_boolean('paste-on-select'))
+        if (!this._settings || !this._settings.get_boolean('paste-on-select'))
             return;
 
         // Give the focused window time to get keyboard focus back after the
@@ -260,14 +263,14 @@ export default class ClipdeckExtension extends Extension {
         });
     }
 
-    _setClipboard(entry) {
+    async _setClipboard(entry) {
         switch (entry.type) {
         case 'text':
             this._clipboard.set_text(CLIPBOARD, entry.text);
             break;
         case 'image': {
-            const [, contents] = Gio.File.new_for_path(this._store.blobPath(entry)).load_contents(null);
-            this._clipboard.set_content(CLIPBOARD, entry.mime, new GLib.Bytes(contents));
+            const [contents] = await Gio.File.new_for_path(this._store.blobPath(entry)).load_contents_async(null);
+            this._clipboard?.set_content(CLIPBOARD, entry.mime, new GLib.Bytes(contents));
             break;
         }
         case 'files': {
@@ -283,7 +286,7 @@ export default class ClipdeckExtension extends Extension {
 
     _sendPasteKeys() {
         if (!this._virtualKeyboard) {
-            const seat = Clutter.get_default_backend().get_default_seat();
+            const seat = global.stage.context.get_backend().get_default_seat();
             this._virtualKeyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         }
 
